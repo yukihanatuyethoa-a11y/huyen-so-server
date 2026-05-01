@@ -1015,12 +1015,21 @@
 
     // Order form → show payment section
     const orderForm = document.getElementById('orderForm');
-    const paymentSections = {
-      '109k': document.getElementById('paymentSection-109k'),
-      '299k': document.getElementById('paymentSection-299k'),
-      '449k': document.getElementById('paymentSection-449k')
-    };
-    orderForm.addEventListener('submit', (e) => {
+    console.log('🔍 orderForm found:', orderForm);
+
+    if (!orderForm) {
+      console.error('❌ Form #orderForm not found!');
+    } else {
+      const paymentSections = {
+        '109k': document.getElementById('paymentSection-109k'),
+        '299k': document.getElementById('paymentSection-299k'),
+        '449k': document.getElementById('paymentSection-449k')
+      };
+      console.log('📋 Payment sections:', paymentSections);
+
+      orderForm.addEventListener('submit', (e) => {
+        console.log('✅ Form submit event fired!');
+
       e.preventDefault();
       const pkg = orderForm.querySelector('[name="package"]').value;
 
@@ -1046,6 +1055,7 @@
         paymentSections[pkg].scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     });
+    }
 
     // Smooth scroll for anchor links
     document.querySelectorAll('a[href^="#"]').forEach(link => {
