@@ -985,50 +985,28 @@
     const SHEET_ENDPOINT = 'https://script.google.com/macros/s/AKfycbwTn6XOscY-zOuW3BxcDYw__KAlgCjfW-tjWiaXSv74EKGThOklwR6KRETKZxplY3oh_g/exec';
 
     function sendToSheet(formData) {
-      console.log('📤 sendToSheet called with:', formData);
+      if (!SHEET_ENDPOINT || SHEET_ENDPOINT.startsWith('PASTE')) return;
 
-      if (!SHEET_ENDPOINT || SHEET_ENDPOINT.startsWith('PASTE')) {
-        console.warn('⚠️ SHEET_ENDPOINT not set:', SHEET_ENDPOINT);
-        return;
-      }
+      // Build query string
+      const queryString = Object.entries(formData)
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+        .join('&');
 
-      console.log('📍 SHEET_ENDPOINT:', SHEET_ENDPOINT);
-
-      // Convert to URLSearchParams (works with no-cors)
-      const params = new URLSearchParams();
-      for (const [key, value] of Object.entries(formData)) {
-        params.append(key, value);
-      }
-
-      console.log('🔄 Sending URLSearchParams...');
-
-      // Send without custom headers (browser auto-sets content-type)
-      fetch(SHEET_ENDPOINT, {
-        method: 'POST',
-        mode: 'no-cors',
-        body: params
-      })
-      .then(() => console.log('✅ Fetch sent successfully'))
-      .catch(err => console.error('❌ Fetch error:', err)); // log errors
+      // Send via image pixel (most reliable)
+      const url = SHEET_ENDPOINT + '?' + queryString;
+      new Image().src = url;
     }
     // ───────────────────────────────────────────────────────────
 
     // Order form → show payment section
     const orderForm = document.getElementById('orderForm');
-    console.log('🔍 orderForm found:', orderForm);
+    const paymentSections = {
+      '109k': document.getElementById('paymentSection-109k'),
+      '299k': document.getElementById('paymentSection-299k'),
+      '449k': document.getElementById('paymentSection-449k')
+    };
 
-    if (!orderForm) {
-      console.error('❌ Form #orderForm not found!');
-    } else {
-      const paymentSections = {
-        '109k': document.getElementById('paymentSection-109k'),
-        '299k': document.getElementById('paymentSection-299k'),
-        '449k': document.getElementById('paymentSection-449k')
-      };
-      console.log('📋 Payment sections:', paymentSections);
-
-      orderForm.addEventListener('submit', (e) => {
-        console.log('✅ Form submit event fired!');
+    orderForm.addEventListener('submit', (e) => {
 
       e.preventDefault();
       const pkg = orderForm.querySelector('[name="package"]').value;
@@ -1055,7 +1033,6 @@
         paymentSections[pkg].scrollIntoView({ behavior: 'smooth', block: 'center' });
       }
     });
-    }
 
     // Smooth scroll for anchor links
     document.querySelectorAll('a[href^="#"]').forEach(link => {
