@@ -987,35 +987,18 @@
     function sendToSheet(formData) {
       if (!SHEET_ENDPOINT || SHEET_ENDPOINT.startsWith('PASTE')) return;
 
-      // Create hidden iframe for form submission
-      const iframe = document.createElement('iframe');
-      iframe.style.display = 'none';
-      iframe.name = 'sheet_iframe_' + Date.now();
-      document.body.appendChild(iframe);
-
-      // Create hidden form
-      const form = document.createElement('form');
-      form.method = 'POST';
-      form.action = SHEET_ENDPOINT;
-      form.target = iframe.name;
-
-      // Add form fields
+      // Convert to URLSearchParams (works with no-cors)
+      const params = new URLSearchParams();
       for (const [key, value] of Object.entries(formData)) {
-        const input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = key;
-        input.value = value;
-        form.appendChild(input);
+        params.append(key, value);
       }
 
-      document.body.appendChild(form);
-      form.submit();
-
-      // Cleanup
-      setTimeout(() => {
-        document.body.removeChild(form);
-        document.body.removeChild(iframe);
-      }, 1000);
+      // Send without custom headers (browser auto-sets content-type)
+      fetch(SHEET_ENDPOINT, {
+        method: 'POST',
+        mode: 'no-cors',
+        body: params
+      }).catch(() => {}); // silent
     }
     // ───────────────────────────────────────────────────────────
 
