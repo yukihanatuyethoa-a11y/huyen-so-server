@@ -987,14 +987,14 @@
     function sendToSheet(formData) {
       if (!SHEET_ENDPOINT || SHEET_ENDPOINT.startsWith('PASTE')) return;
 
-      // Build query string
-      const queryString = Object.entries(formData)
-        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-        .join('&');
+      // Convert to FormData for POST
+      const fd = new FormData();
+      for (const [key, value] of Object.entries(formData)) {
+        fd.append(key, value);
+      }
 
-      // Send via image pixel (most reliable)
-      const url = SHEET_ENDPOINT + '?' + queryString;
-      new Image().src = url;
+      // Use sendBeacon for reliable cross-origin POST
+      navigator.sendBeacon(SHEET_ENDPOINT, fd);
     }
     // ───────────────────────────────────────────────────────────
 
