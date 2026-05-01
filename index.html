@@ -986,11 +986,14 @@
 
     function sendToSheet(formData) {
       if (!SHEET_ENDPOINT || SHEET_ENDPOINT.startsWith('PASTE')) return;
+      const formBody = new URLSearchParams();
+      for (const [key, value] of Object.entries(formData)) {
+        formBody.append(key, value);
+      }
       fetch(SHEET_ENDPOINT, {
         method: 'POST',
         mode: 'no-cors',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
+        body: formBody
       }).catch(() => {}); // silent — không chặn UX
     }
     // ───────────────────────────────────────────────────────────
