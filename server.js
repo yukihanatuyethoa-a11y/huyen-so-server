@@ -1,15 +1,18 @@
 // ============================================================
 // HUYỀN SỐ — SePay Webhook Server
-// Node.js + Express — Deploy lên Railway
+// Node.js + Express — Deploy trên Railway
 // ============================================================
 //
-// Luồng:
-//   1. Khách chuyển khoản với mã CK (TKPHS109000, etc.)
-//   2. SePay gửi webhook → server nhận
-//   3. Server parse mã CK → tìm hàng trên sheet
-//   4. Tự động update "Trạng thái TT" → "Đã thanh toán"
+// Luồng thanh toán:
+//   1. Khách điền form → Apps Script lưu vào Sheet (mã CK dạng PHS1234567)
+//   2. Khách chuyển khoản với nội dung = mã CK
+//   3. SePay gửi webhook POST /webhook → server này nhận
+//   4. Server tìm mã CK trong Sheet → cập nhật "Đã thanh toán"
 //   5. Gửi Telegram noti cho admin
 //
+// Polling từ frontend:
+//   Frontend gọi GET /check-payment?code=PHS1234567
+//   Server đọc Sheet, trả về { paid: true/false }
 // ============================================================
 
 const express = require('express');
@@ -20,53 +23,63 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
-// ===== CẤU HÌNH =====
+// ── CORS: cho phép Vercel frontend gọi API ──────────────────
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  next();
+});
+
+// ── Cấu hình ────────────────────────────────────────────────
 const CONFIG = {
   PORT: process.env.PORT || 3000,
-  TELEGRAM_GROUP_ID: process.env.TELEGRAM_GROUP_ID || '-5001844130',
-  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
-
-  // Google Sheets
+  TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '5310615235',
+  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '8095135618:AAEQ_76D-SfpFG4n3qW-XaJrjdlPO4DEVYc',
   GOOGLE_SHEET_ID: process.env.GOOGLE_SHEET_ID || '',
-  GOOGLE_SERVICE_ACCOUNT: process.env.GOOGLE_SERVICE_ACCOUNT
-    ? JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT)
-    : {},
+  GOOGLE_SERVICE_ACCOUNT: (() => {
+    try { return JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || '{}'); }
+    catch { return {}; }
+  })(),
+  SEPAY_WEBHOOK_SECRET: process.env.SEPAY_WEBHOOK_SECRET || '',
 };
 
-// Mã CK → Gói mapping
-const PACKAGE_MAP = {
-  'TKPHS109000': { goi: 'Gói Nhập Môn', gia: '109.000đ' },
-  'TKPHS299000': { goi: 'Gói Đầy Đủ', gia: '299.000đ' },
-  'TKPHS449000': { goi: 'Gói Cải Mệnh', gia: '449.000đ' },
-};
-
-// ===== GOOGLE SHEETS AUTH =====
+// ── Google Sheets auth ───────────────────────────────────────
 const sheets = google.sheets('v4');
 const auth = new google.auth.GoogleAuth({
   credentials: CONFIG.GOOGLE_SERVICE_ACCOUNT,
   scopes: ['https://www.googleapis.com/auth/spreadsheets'],
 });
 
-async function getSheetAuth() {
-  return await auth.getClient();
-}
-
-// ===== WEBHOOK ENDPOINT =====
+// ── WEBHOOK: SePay gọi vào đây khi có tiền vào ──────────────
 app.post('/webhook', async (req, res) => {
   try {
     console.log('📥 Webhook received:', new Date().toISOString());
-    console.log('Payload:', JSON.stringify(req.body, null, 2));
+    console.log('Body:', JSON.stringify(req.body));
 
-    // Respond immediately (don't make SePay wait)
+    // Xác minh webhook secret (nếu đã cấu hình trong SePay)
+    if (CONFIG.SEPAY_WEBHOOK_SECRET) {
+      const token = req.headers['authorization'] || req.headers['x-sepay-token'] || '';
+      const clean = token.replace(/^Bearer\s+/i, '');
+      if (clean !== CONFIG.SEPAY_WEBHOOK_SECRET) {
+        console.warn('⚠️ Webhook secret không khớp');
+        return res.status(401).json({ error: 'Unauthorized' });
+      }
+    }
+
+    // Chỉ xử lý tiền vào
+    if (req.body.transferType && req.body.transferType !== 'in') {
+      return res.status(200).json({ status: 'ignored' });
+    }
+
+    // Trả về 200 ngay để SePay không retry
     res.status(200).json({ status: 'received' });
 
-    // Process async
+    // Xử lý bất đồng bộ
     processPayment(req.body).catch(err => {
-      console.error('❌ Payment processing error:', err.message);
-      sendTelegramMessage(
-        `🚨 Lỗi xử lí webhook:\n${err.message}`,
-        CONFIG.TELEGRAM_GROUP_ID
-      ).catch(() => {});
+      console.error('❌ Lỗi xử lý payment:', err.message);
+      sendTelegram(`🚨 <b>Lỗi webhook</b>\n${err.message}`).catch(() => {});
     });
 
   } catch (err) {
@@ -75,193 +88,192 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ===== PROCESS PAYMENT =====
+// ── CHECK PAYMENT: frontend poll vào đây ────────────────────
+app.get('/check-payment', async (req, res) => {
+  const code = (req.query.code || '').toUpperCase().trim();
+  if (!code) return res.json({ paid: false, error: 'Missing code' });
+
+  try {
+    const result = await findOrderByCode(code);
+    if (!result) return res.json({ paid: false, found: false });
+    return res.json({
+      paid: result.trangThaiTT === 'Đã thanh toán',
+      status: result.trangThaiTT,
+      found: true,
+    });
+  } catch (err) {
+    console.error('check-payment error:', err.message);
+    return res.json({ paid: false, error: err.message });
+  }
+});
+
+// ── XỬ LÝ THANH TOÁN ────────────────────────────────────────
 async function processPayment(payload) {
-  // Parse SePay webhook payload
-  // SePay structure: { transferAmount, description, content, transactionDate, ... }
+  // SePay gửi nội dung CK trong trường "content"
+  // Một số trường hợp còn có "description" — kiểm tra cả hai
+  const content = (payload.content || payload.description || '').toUpperCase().trim();
+  const amount  = parseInt(payload.transferAmount) || 0;
+  const txDate  = payload.transactionDate || new Date().toISOString();
 
-  const description = payload.description || '';
-  const content = payload.content || '';
-  const amount = parseInt(payload.transferAmount) || 0;
-  const transferDate = payload.transactionDate || new Date().toISOString();
+  console.log('Processing:', { content, amount, txDate });
 
-  console.log('Parsing payment:');
-  console.log('  Description:', description);
-  console.log('  Content:', content);
-  console.log('  Amount:', amount);
-
-  // Find order code (TKPHS109000, TKPHS299000, TKPHS449000)
-  const orderCodeMatch = description.match(/(TKPHS\d+)/);
-  if (!orderCodeMatch) {
-    console.warn('⚠️ Order code not found in description');
+  if (!content) {
+    await sendTelegram(
+      `💰 <b>TIỀN VÀO — Không có nội dung CK!</b>\n` +
+      `💵 ${amount.toLocaleString('vi-VN')}đ\n` +
+      `⚠️ Kiểm tra thủ công trong app ngân hàng!`
+    );
     return;
   }
 
-  const orderCode = orderCodeMatch[1];
-  const packageInfo = PACKAGE_MAP[orderCode];
+  // Tìm và cập nhật đơn hàng
+  const order = await findAndUpdateOrder(content, amount, txDate);
 
-  if (!packageInfo) {
-    console.warn('⚠️ Unknown package code:', orderCode);
-    return;
-  }
-
-  console.log('✅ Found order code:', orderCode, packageInfo);
-
-  // Find & update row in sheet
-  const result = await findAndUpdateOrder(orderCode, amount, transferDate);
-
-  if (result) {
-    console.log('✅ Order updated:', result);
-
-    // Send Telegram notification
-    const message = formatTelegramMessage(result, packageInfo, orderCode);
-    await sendTelegramMessage(message, CONFIG.TELEGRAM_GROUP_ID);
-
-    console.log('✅ Telegram notification sent');
+  if (order) {
+    await sendTelegram(
+      `✅ <b>THANH TOÁN XÁC NHẬN</b>\n\n` +
+      `🎯 Đơn: <b>HS-${String(order.stt).padStart(3, '0')}</b>\n` +
+      `👤 ${order.name}\n` +
+      `📧 ${order.email}\n` +
+      `📦 ${order.goi}\n` +
+      `💰 ${amount.toLocaleString('vi-VN')}đ\n` +
+      `🔑 Mã CK: <code>${order.maCK}</code>\n` +
+      `⏰ ${txDate}\n\n` +
+      `✅ Sheet đã cập nhật\n\n` +
+      `📋 <b>Việc cần làm:</b>\n` +
+      `1. Tạo file lá số cho ${order.name}\n` +
+      `2. Upload lên Google Drive\n` +
+      `3. Dán link vào cột L trên Sheet\n` +
+      `→ <b>Email tự động gửi ngay!</b>`
+    );
   } else {
-    console.warn('⚠️ Order not found on sheet');
+    await sendTelegram(
+      `💰 <b>TIỀN VÀO — Không khớp đơn nào!</b>\n` +
+      `💵 ${amount.toLocaleString('vi-VN')}đ\n` +
+      `📝 Nội dung: <code>${content}</code>\n` +
+      `⚠️ Kiểm tra thủ công trong Sheet!`
+    );
   }
 }
 
-// ===== FIND & UPDATE ORDER ON SHEET =====
-async function findAndUpdateOrder(orderCode, amount, transferDate) {
-  try {
-    const authClient = await getSheetAuth();
+// ── TÌM ĐƠN THEO MÃ CK (dùng cho /check-payment) ───────────
+async function findOrderByCode(code) {
+  if (!CONFIG.GOOGLE_SHEET_ID) return null;
+  const authClient = await auth.getClient();
+  const res = await sheets.spreadsheets.values.get({
+    auth: authClient,
+    spreadsheetId: CONFIG.GOOGLE_SHEET_ID,
+    range: 'Đơn Hàng!A:O',
+  });
 
-    // Get all values from sheet
-    const response = await sheets.spreadsheets.values.get({
-      auth: authClient,
-      spreadsheetId: CONFIG.GOOGLE_SHEET_ID,
-      range: 'Đơn Hàng!A:O', // All columns
-    });
-
-    const rows = response.data.values || [];
-    if (rows.length < 2) {
-      console.warn('Sheet is empty');
-      return null;
+  const rows = res.data.values || [];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const maCK = (row[9] || '').toUpperCase().trim(); // Cột J
+    if (maCK && maCK === code) {
+      return {
+        stt:         row[0],
+        name:        row[2],
+        email:       row[6],
+        goi:         row[7],
+        maCK:        row[9],
+        trangThaiTT: row[11] || 'Chờ thanh toán',
+      };
     }
-
-    // Header = row 0
-    // Data starts from row 1
-
-    // Find row with matching Mã CK (column J = 10)
-    let targetRow = null;
-    let orderData = null;
-
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      const maCK = row[9] || ''; // Column J (0-indexed = 9)
-
-      if (maCK.includes(orderCode)) {
-        targetRow = i + 1; // 1-based for API
-        orderData = {
-          stt: row[0],
-          name: row[2],
-          email: row[6],
-          goi: row[7],
-          maCK: maCK,
-        };
-        break;
-      }
-    }
-
-    if (!targetRow) {
-      console.warn(`Order code ${orderCode} not found on sheet`);
-      return null;
-    }
-
-    console.log(`Found order at row ${targetRow}:`, orderData);
-
-    // Update Trạng thái TT (column L = 11) to "Đã thanh toán"
-    await sheets.spreadsheets.values.update({
-      auth: authClient,
-      spreadsheetId: CONFIG.GOOGLE_SHEET_ID,
-      range: `Đơn Hàng!L${targetRow}`,
-      valueInputOption: 'RAW',
-      requestBody: {
-        values: [['Đã thanh toán']],
-      },
-    });
-
-    console.log(`✅ Updated row ${targetRow}: Trạng thái TT = "Đã thanh toán"`);
-
-    return {
-      row: targetRow,
-      ...orderData,
-      amount: amount,
-      transferDate: transferDate,
-    };
-
-  } catch (err) {
-    console.error('❌ Sheet update error:', err.message);
-    throw err;
   }
+  return null;
 }
 
-// ===== FORMAT TELEGRAM MESSAGE =====
-function formatTelegramMessage(order, packageInfo, orderCode) {
-  const transferDateStr = new Date(order.transferDate).toLocaleString('vi-VN');
+// ── TÌM VÀ CẬP NHẬT ĐƠN (dùng khi xử lý webhook) ──────────
+async function findAndUpdateOrder(content, amount, txDate) {
+  if (!CONFIG.GOOGLE_SHEET_ID) {
+    console.error('GOOGLE_SHEET_ID chưa được cấu hình!');
+    return null;
+  }
 
-  return `✅ *THANH TOÁN THÀNH CÔNG*
+  const authClient = await auth.getClient();
+  const res = await sheets.spreadsheets.values.get({
+    auth: authClient,
+    spreadsheetId: CONFIG.GOOGLE_SHEET_ID,
+    range: 'Đơn Hàng!A:O',
+  });
 
-🎯 *Đơn hàng:* HS-${String(order.stt).padStart(3, '0')}
-👤 *Khách:* ${order.name}
-📦 *Gói:* ${packageInfo.goi}
-💰 *Số tiền:* ${order.amount.toLocaleString('vi-VN')} VND
-💾 *Mã CK:* \`${orderCode}\`
-⏰ *Thời gian:* ${transferDateStr}
-📧 *Email:* ${order.email}
+  const rows = res.data.values || [];
+  let targetRow = null;
+  let orderData = null;
 
-✅ Sheet đã cập nhật: Trạng thái TT = "Đã thanh toán"
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const maCK       = (row[9]  || '').toUpperCase().trim(); // Cột J — Mã CK
+    const trangThai  = (row[11] || '').trim();               // Cột L — Trạng thái TT
 
-🔔 *Hành động tiếp theo:*
-1. Tạo file lá số cá nhân cho ${order.name}
-2. Upload lên Google Drive
-3. Dán link vào cột "Link File" trên sheet
-4. Bấm menu ✦ Huyền Số → Giao hàng
-`;
+    // Tìm mã CK trong nội dung chuyển khoản, bỏ qua đơn đã thanh toán
+    if (maCK && content.includes(maCK) && trangThai !== 'Đã thanh toán') {
+      targetRow = i + 1; // Google Sheets API dùng 1-based
+      orderData = {
+        stt:   row[0],
+        name:  row[2],
+        email: row[6],
+        goi:   row[7],
+        maCK:  row[9],
+      };
+      break;
+    }
+  }
+
+  if (!targetRow) {
+    console.warn('Không tìm thấy đơn khớp với nội dung:', content);
+    return null;
+  }
+
+  console.log(`✅ Tìm thấy đơn tại hàng ${targetRow}:`, orderData);
+
+  // Cập nhật trạng thái thanh toán → "Đã thanh toán"
+  await sheets.spreadsheets.values.update({
+    auth: authClient,
+    spreadsheetId: CONFIG.GOOGLE_SHEET_ID,
+    range: `Đơn Hàng!L${targetRow}`,
+    valueInputOption: 'RAW',
+    requestBody: { values: [['Đã thanh toán']] },
+  });
+
+  console.log(`✅ Cập nhật hàng ${targetRow}: Đã thanh toán`);
+  return orderData;
 }
 
-// ===== SEND TELEGRAM MESSAGE =====
-async function sendTelegramMessage(message, chatId) {
+// ── GỬI TELEGRAM ────────────────────────────────────────────
+async function sendTelegram(text) {
   if (!CONFIG.TELEGRAM_BOT_TOKEN) {
-    console.warn('⚠️ TELEGRAM_BOT_TOKEN not set, skipping message');
+    console.warn('TELEGRAM_BOT_TOKEN chưa cấu hình');
     return;
   }
-
   try {
-    const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`;
-
-    await axios.post(url, {
-      chat_id: chatId,
-      text: message,
-      parse_mode: 'Markdown',
-    });
-
-    console.log('✅ Telegram message sent to', chatId);
-
+    await axios.post(
+      `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
+      { chat_id: CONFIG.TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' }
+    );
   } catch (err) {
-    console.error('❌ Telegram send error:', err.message);
-    throw err;
+    console.error('Telegram error:', err.message);
   }
 }
 
-// ===== HEALTH CHECK =====
+// ── HEALTH CHECK ─────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'Huyền Số Server is running ✅',
-    timestamp: new Date().toISOString(),
+    status: '✅ Huyền Số Server đang chạy',
+    time: new Date().toISOString(),
+    sheetConfigured: !!CONFIG.GOOGLE_SHEET_ID,
+    telegramConfigured: !!CONFIG.TELEGRAM_BOT_TOKEN,
   });
 });
 
-app.get('/health', (req, res) => {
-  res.json({ ok: true });
-});
+app.get('/health', (req, res) => res.json({ ok: true }));
 
-// ===== START SERVER =====
+// ── START ────────────────────────────────────────────────────
 app.listen(CONFIG.PORT, () => {
-  console.log(`🚀 Huyền Số Server listening on port ${CONFIG.PORT}`);
-  console.log(`📥 Webhook endpoint: POST /webhook`);
-  console.log(`📊 Sheet ID: ${CONFIG.GOOGLE_SHEET_ID}`);
-  console.log(`💬 Telegram Group: ${CONFIG.TELEGRAM_GROUP_ID}`);
+  console.log(`🚀 Server chạy trên port ${CONFIG.PORT}`);
+  console.log(`📥 Webhook: POST /webhook`);
+  console.log(`🔍 Check payment: GET /check-payment?code=PHS...`);
+  console.log(`📊 Sheet ID: ${CONFIG.GOOGLE_SHEET_ID || '⚠️ CHƯA CẤU HÌNH'}`);
+  console.log(`💬 Telegram Chat: ${CONFIG.TELEGRAM_CHAT_ID}`);
 });
